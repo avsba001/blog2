@@ -1,0 +1,229 @@
+/**
+ * 邮件验证服务
+ *
+ * 功能：
+ * - 统一处理所有邮件验证码逻辑
+ * - 生成和验证码验证
+ * - 速率限制
+ * - 验证码类型管理
+ *
+ * @author 博客系统
+ * @version 1.0.0
+ * @created 2026-02-13
+ */
+
+import { AUTH_CONSTANTS } from '../config/constants';
+import { createModuleLogger } from '../utils/logger';
+
+const logger = createModuleLogger('email');
+import { safeGetCache, safePutCache, safeDeleteCache } from '../utils/cache';
+
+/**
+ * 验证码邮件类型
+ */
+export type VerificationEmailType = 'register' | 'password' | 'delete' | 'forgot_password';
+
+/**
+ * 验证码选项接口
+ */
+export interface VerificationCodeOptions {
+  type: VerificationEmailType;
+  email: string;
+  userId?: number; // 对于 password/delete 类型，需要提供 userId
+}
+
+/**
+ * 验证结果接口
+ */
+export interface VerificationResult {
+  success: boolean;
+  message: string;
+  data?: any;
+}
+
+/**
+ * 邮件验证服务类
+ */
+export class EmailVerificationService {
+  /**
+   * 生成验证码
+   * 生成6位数字验证码
+   */
+  private static generateVerificationCode(): string {
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    let n = 0;
+    for (let i = 0; i < 4; i++) {
+      n = (n << 8) | bytes[i];
+    }
+    return String(Math.abs(n) % 1000000).padStart(6, '0');
+  }
+
+  /**
+   * 检查速率限制
+   * @param cache Cloudflare KV 缓存
+   * @param type 验证类型
+   * @param email 邮箱地址
+   * @returns 是否超过限制
+   */
+  static async checkRateLimit(
+    cache: any,
+    type: VerificationEmailType,
+    email: string
+  ): Promise<{ limited: boolean; remaining: number }> {
+    const rateKey = `email_verify_rate:${type}:${email.toLowerCase()}`;
+    const rateVal = await safeGetCache(cache, rateKey);
+    const rateCount = rateVal ? parseInt(rateVal, 10) : 0;
+
+    const limited = rateCount >= AUTH_CONSTANTS.EMAIL_VERIFY_RATE_MAX;
+    const remaining = Math.max(0, AUTH_CONSTANTS.EMAIL_VERIFY_RATE_MAX - rateCount);
+
+    return { limited, remaining };
+  }
+
+  /**
+   * 发送验证码
+   * 生成验证码并存储到缓存，准备发送邮件
+   *
+   * @param db Cloudflare D1 数据库
+   * @param cache Cloudflare KV 缓存
+   * @param options 验证选项
+   * @returns 验证码（用于邮件发送）
+   */
+  static async sendVerificationCode(
+    db: any,
+    cache: any,
+    options: VerificationCodeOptions
+  ): Promise<VerificationResult> {
+    const { type, email } = options;
+    const normalizedEmail = email.toLowerCase();
+
+    try {
+      // 检查速率限制
+      const rateKey = `email_verify_rate:${type}:${normalizedEmail}`;
+      const rateVal = await safeGetCache(cache, rateKey);
+      const rateCount = rateVal ? parseInt(rateVal, 10) : 0;
+
+      if (rateCount >= AUTH_CONSTANTS.EMAIL_VERIFY_RATE_MAX) {
+        return {
+          success: false,
+          message: `邮件发送过于频繁，请在1小时后重试（还剩 ${AUTH_CONSTANTS.EMAIL_VERIFY_RATE_MAX - rateCount} 次机会）`
+        };
+      }
+
+      // 生成验证码
+      const code = this.generateVerificationCode();
+
+      // 存储到缓存
+      const kvKey = `email_verify:${type}:${normalizedEmail}`;
+      await safePutCache(cache, kvKey, code, { expirationTtl: AUTH_CONSTANTS.VERIFICATION_CODE_TTL });
+
+      // 更新速率限制计数
+      const newRateCount = rateCount + 1;
+      await safePutCache(
+        cache,
+        rateKey,
+        String(newRateCount),
+        { expirationTtl: AUTH_CONSTANTS.EMAIL_VERIFY_RATE_WINDOW }
+      );
+
+      return {
+        success: true,
+        message: '验证码已发送',
+        data: { code, ttl: AUTH_CONSTANTS.VERIFICATION_CODE_TTL }
+      };
+    } catch (error) {
+      logger.error('Failed to send verification code:', error);
+      return {
+        success: false,
+        message: '发送验证码失败，请稍后重试'
+      };
+    }
+  }
+
+  /**
+   * 验证码验证
+   * 检查验证码是否正确，并删除已使用的验证码
+   *
+   * @param cache Cloudflare KV 缓存
+   * @param type 验证类型
+   * @param email 邮箱地址
+   * @param code 用户输入的验证码
+   * @returns 验证结果
+   */
+  static async verifyCode(
+    cache: any,
+    type: VerificationEmailType,
+    email: string,
+    code: string
+  ): Promise<VerificationResult> {
+    try {
+      const normalizedEmail = email.toLowerCase();
+      const kvKey = `email_verify:${type}:${normalizedEmail}`;
+      // 失败计数键：验证码是 6 位数字，不限次尝试即可爆破，必须按「邮箱+类型」计次
+      const attemptKey = `email_verify_attempts:${type}:${normalizedEmail}`;
+
+      // 超限先查：避免已锁定后仍能继续试探
+      const attemptVal = await safeGetCache(cache, attemptKey);
+      const attempts = attemptVal ? parseInt(attemptVal, 10) : 0;
+      if (attempts >= AUTH_CONSTANTS.EMAIL_VERIFY_MAX_ATTEMPTS) {
+        await safeDeleteCache(cache, kvKey);
+        return {
+          success: false,
+          message: '尝试次数过多，验证码已失效，请重新获取'
+        };
+      }
+
+      // 从缓存获取存储的验证码
+      const storedCode = await safeGetCache(cache, kvKey);
+
+      // 验证码不存在或已过期
+      if (!storedCode) {
+        return {
+          success: false,
+          message: '验证码已过期或无效，请重新申请'
+        };
+      }
+
+      // 检查验证码是否匹配
+      if (storedCode !== String(code).trim()) {
+        const newAttempts = attempts + 1;
+        await safePutCache(cache, attemptKey, String(newAttempts), {
+          expirationTtl: AUTH_CONSTANTS.VERIFICATION_CODE_TTL
+        });
+        // 最后一次失败即作废验证码，重置计数的唯一途径是重新获取
+        if (newAttempts >= AUTH_CONSTANTS.EMAIL_VERIFY_MAX_ATTEMPTS) {
+          await safeDeleteCache(cache, kvKey);
+          return {
+            success: false,
+            message: '尝试次数过多，验证码已失效，请重新获取'
+          };
+        }
+        return {
+          success: false,
+          message: `验证码错误，请重新输入（还剩 ${AUTH_CONSTANTS.EMAIL_VERIFY_MAX_ATTEMPTS - newAttempts} 次机会）`
+        };
+      }
+
+      // 验证码正确，删除它（一次性使用）并清零失败计数
+      await safeDeleteCache(cache, kvKey);
+      await safeDeleteCache(cache, attemptKey);
+
+      return {
+        success: true,
+        message: '验证成功'
+      };
+    } catch (error) {
+      logger.error('Failed to verify code:', error);
+      return {
+        success: false,
+        message: '验证过程出错，请稍后重试'
+      };
+    }
+  }
+}
+
+/**
+ * 导出类型供其他模块使用
+ */
+

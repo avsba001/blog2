@@ -1,0 +1,77 @@
+name = "blog"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+# 静态资源挂到同一 Worker 后，导航请求（浏览器深链）优先交给静态资源、
+# 不进入 Worker，避免 Hono 的 JSON 404 覆盖 SPA 的 index.html。
+# 保持 compatibility_date 不变，避免既有运行时行为发生变化。
+compatibility_flags = ["assets_navigation_prefers_asset_serving"]
+
+# 前端静态资源（Vite 产物），与 API 同域部署
+# run_worker_first：API 与 SEO 出口（/posts/* meta 注入、sitemap）必须先经 Worker，
+# 其余导航请求仍由 assets 优先（SPA 深链不被 API 404 吃掉）
+[assets]
+directory = "../frontend/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/posts/*", "/sitemap.xml"]
+
+
+# D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "blog-db"
+database_id = "1edddff8-c00a-48b5-b33b-e0e6c14ddff4"
+
+# KV 缓存
+[[kv_namespaces]]
+binding = "CACHE"
+id = "69c0b7cfff1d48769cc2bd29f2d9711f"
+
+# R2 存储
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "blog-storage"
+
+# Durable Object - 原子限流计数器
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter"]
+
+# 日志配置
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+# 定时任务触发器（每 15 分钟扫描一次到期汇总，daily / weekly 在同一任务内处理）
+[triggers]
+crons = ["*/15 * * * *"]
+
+# 环境变量（公开的配置）
+[vars]
+ENVIRONMENT = "production"
+FRONTEND_URL = "https://blog.wort.uk"
+STORAGE_PUBLIC_URL = "https://storage.blog.wort.uk"
+
+# Secrets（需要通过命令行或Cloudflare Dashboard设置）
+# wrangler secret put JWT_SECRET
+# wrangler secret put POST_PASSWORD_SECRET  # 文章密码访问 Token 密钥（可选，默认使用 JWT_SECRET）
+# wrangler secret put GITHUB_CLIENT_ID
+# wrangler secret put GITHUB_CLIENT_SECRET
+
+# 或者在Cloudflare Dashboard设置:
+# Workers & Pages > blog > Settings > Variables
+# 添加以下环境变量（加密）：
+# - JWT_SECRET: 用户认证 JWT 密钥
+# - POST_PASSWORD_SECRET: 文章密码访问 Token 密钥（可选）
+# - GITHUB_CLIENT_ID: GitHub OAuth Client ID
+# - GITHUB_CLIENT_SECRET: GitHub OAuth Client Secret
